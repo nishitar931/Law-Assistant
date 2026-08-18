@@ -1,0 +1,27 @@
+flask
+flask-cors
+python-dotenv
+
+# LangChain (+ community split)
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# Gemini through LangChain
+langchain-google-genai  # ChatGoogleGenerativeAI  :contentReference[oaicite:4]{index=4}
+google-genai         # Official SDK (modern)   :contentReference[oaicite:5]{index=5}
+
+# Vector + embeddings
+faiss-cpu         # Linux/macOS wheels; Windows needs WSL or conda
+sentence-transformers
+huggingface-hub
+
+# PDF + OCR
+PyPDF2
+pdf2image
+pytesseract
+Pillow
+
+PyJWT
+Werkzeug
