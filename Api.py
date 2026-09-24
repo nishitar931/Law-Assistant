@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable, Any, Dict, List, Tuple
 from functools import wraps
 
-from flask import Flask, request, jsonify, Response, g
+from flask import Flask, request, jsonify, g, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 import jwt
@@ -22,9 +22,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# ---- CORS (explicit origins recommended when using credentials) ----
-_default_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
-ALLOWED_ORIGINS = [o.strip() for o in _default_origins.split(",") if o.strip()]
+# ---- CORS ----
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
@@ -41,28 +39,24 @@ JWT_ALGO = os.environ.get("JWT_ALGO", "HS256")
 JWT_EXPIRE_HOURS = int(os.environ.get("JWT_EXPIRE_HOURS", "2"))
 DB_PATH = os.environ.get("DB_PATH", "./app.db")
 
-# Toggle this to protect chat routes
-PROTECT_CHAT_ROUTES = True
+PROTECT_CHAT_ROUTES = False
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is required")
+    raise RuntimeError("GEMINI_API_KEY is required in .env or environment")
 
-# ---- Load persisted index (MUST exist) ----
-vector_store = load_vector_store_or_raise(INDEX_DIR)  # raises if missing
+# ---- Load Persisted Index ----
+vector_store = load_vector_store_or_raise(INDEX_DIR)
 
 pdf = PDFProcessor()
 agent = AgentOrchestrator(
     gemini_api_key=GEMINI_API_KEY,
-    vector_store=vector_store
+    vector_store=vector_store,
+    db_path=DB_PATH
 )
 
-# ================== DB Helpers ==================
+# ================== DB Helpers & Auto-Seeding ==================
 def get_db() -> sqlite3.Connection:
-    """
-    One connection per request; enable foreign keys for integrity.
-    Row factory returns sqlite3.Row for dict-like access.
-    """
     if "db" not in g:
         conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -77,12 +71,7 @@ def close_db(exception=None):
         db.close()
 
 def init_db():
-    """
-    Creates base tables if not exist.
-    Adds columns if missing (idempotent, safe for existing DBs).
-    """
     db = get_db()
-    # users table
     db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +79,6 @@ def init_db():
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('client','lawyer')),
             created_at TEXT NOT NULL,
-            -- optional location info (added via migration if missing)
             location_name TEXT,
             location_lat REAL,
             location_lon REAL
@@ -98,7 +86,6 @@ def init_db():
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
 
-    # ensure new columns exist (migrations)
     def _column_exists(table: str, col: str) -> bool:
         cur = db.execute(f"PRAGMA table_info({table})")
         return any(row["name"] == col for row in cur.fetchall())
@@ -111,7 +98,6 @@ def init_db():
         if not _column_exists("users", col):
             db.execute(ddl)
 
-    # chats table
     db.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,6 +113,27 @@ def init_db():
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_chats_pair ON chats(client_id, lawyer_id, created_at)")
     db.commit()
+
+    # Seed Sample Lawyers directly into SQLite if empty
+    sample_lawyers = [
+        ("advocate.rajesh@lexjuris.com", "Indiranagar, Bengaluru, Karnataka", 12.9784, 77.6408),
+        ("priya.sharma.legal@counsels.in", "Koramangala 4th Block, Bengaluru, Karnataka", 12.9352, 77.6245),
+        ("arun.menon@highcourtlaw.org", "MG Road, Bengaluru, Karnataka", 12.9756, 77.6066),
+        ("ananya.deshmukh@cyberlawcorp.com", "Whitefield, Bengaluru, Karnataka", 12.9698, 77.7500),
+    ]
+    for email, loc_name, lat, lon in sample_lawyers:
+        try:
+            pwd_hash = generate_password_hash("LawyerPass123!")
+            db.execute(
+                """
+                INSERT INTO users (email, password_hash, role, created_at, location_name, location_lat, location_lon)
+                VALUES (?, ?, 'lawyer', ?, ?, ?, ?)
+                """,
+                (email, pwd_hash, datetime.now(timezone.utc).isoformat(), loc_name, lat, lon)
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            pass
 
 with app.app_context():
     init_db()
@@ -165,7 +172,6 @@ def jwt_required(fn: Callable) -> Callable:
         except jwt.InvalidTokenError:
             return jsonify({"error": "invalid token"}), 401
 
-        # Attach user info to request context (Flask g)
         g.user = {
             "id": int(payload["sub"]),
             "email": payload["email"],
@@ -173,18 +179,6 @@ def jwt_required(fn: Callable) -> Callable:
         }
         return fn(*args, **kwargs)
     return wrapper
-
-def role_required(*roles: str) -> Callable:
-    def deco(fn: Callable) -> Callable:
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            if not getattr(g, "user", None):
-                return jsonify({"error": "auth required"}), 401
-            if g.user["role"] not in roles:
-                return jsonify({"error": "forbidden: insufficient role"}), 403
-            return fn(*args, **kwargs)
-        return wrapper
-    return deco
 
 # ================== Utilities ==================
 def now_iso() -> str:
@@ -202,8 +196,7 @@ def row_to_user_dict(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance (kilometers)."""
-    R = 6371.0  # km
+    R = 6371.0
     φ1, λ1, φ2, λ2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dφ, dλ = (φ2 - φ1), (λ2 - λ1)
     a = math.sin(dφ/2)**2 + math.cos(φ1) * math.cos(φ2) * math.sin(dλ/2)**2
@@ -227,7 +220,6 @@ def register():
         password = data.get("password") or ""
         role = (data.get("role") or "").strip().lower()
 
-        # optional location on signup
         location_name = (data.get("location_name") or None)
         location_lat = data.get("location_lat")
         location_lon = data.get("location_lon")
@@ -287,72 +279,16 @@ def me():
 @app.get("/me/profile")
 @jwt_required
 def me_profile():
-    """Return the full user row safely (no writes)."""
     db = get_db()
     row = db.execute("SELECT * FROM users WHERE id=?", (g.user["id"],)).fetchone()
     if not row:
         return jsonify({"error": "user not found"}), 404
     return jsonify({"user": row_to_user_dict(row)})
 
-
-@app.patch("/me/location")
-@jwt_required
-def update_location():
-    """
-    Partially update location_name and/or coordinates for the current user.
-    Only keys present in the JSON body are updated. Omitted keys are left unchanged.
-    """
-    try:
-        data = request.get_json(silent=True) or {}
-
-        fields, params = [], []
-
-        if "location_name" in data:
-            fields.append("location_name=?")
-            params.append(data.get("location_name"))
-
-        if "location_lat" in data:
-            lat = data.get("location_lat")
-            lat = float(lat) if lat not in (None, "") else None
-            fields.append("location_lat=?")
-            params.append(lat)
-
-        if "location_lon" in data:
-            lon = data.get("location_lon")
-            lon = float(lon) if lon not in (None, "") else None
-            fields.append("location_lon=?")
-            params.append(lon)
-
-        db = get_db()
-        if fields:
-            params.append(g.user["id"])
-            sql = f"UPDATE users SET {', '.join(fields)} WHERE id=?"
-            db.execute(sql, tuple(params))
-            db.commit()
-
-        row = db.execute("SELECT * FROM users WHERE id=?", (g.user["id"],)).fetchone()
-        return jsonify({"user": row_to_user_dict(row)})
-    except Exception as e:
-        app.logger.exception("update_location failed")
-        return jsonify({"error": f"update_location failed: {e}"}), 500
-
-# Example role-protected route:
-@app.get("/lawyer/dashboard")
-@jwt_required
-@role_required("lawyer")
-def lawyer_only():
-    return jsonify({"message": f"Welcome, {g.user['email']} (lawyer)!"})
-
 # ================== Lawyer Discovery ==================
 @app.get("/lawyers")
 @jwt_required
 def list_lawyers():
-    """
-    Query params:
-      - lat, lon, radius_km (optional) -> geo filter using haversine
-      - q (optional) -> fuzzy filter on email/location_name
-      - limit (optional, default 50)
-    """
     try:
         q = (request.args.get("q") or "").strip().lower()
         lat = parse_float(request.args.get("lat"))
@@ -372,7 +308,6 @@ def list_lawyers():
                     continue
 
             item = row_to_user_dict(r)
-            # compute distance if coordinates given and lawyer has coords
             if lat is not None and lon is not None and r["location_lat"] is not None and r["location_lon"] is not None:
                 dist = haversine_km(lat, lon, r["location_lat"], r["location_lon"])
                 item["distance_km"] = round(dist, 3)
@@ -380,18 +315,14 @@ def list_lawyers():
                     continue
             lawyers.append(item)
 
-        # If distance_km present, sort by it; else keep insertion order
         lawyers.sort(key=lambda x: x.get("distance_km", float("inf")))
         return jsonify({"lawyers": lawyers[:limit]})
     except Exception as e:
         app.logger.exception("list_lawyers failed")
         return jsonify({"error": f"list_lawyers failed: {e}"}), 500
 
-# ================== Client ↔ Lawyer Messaging ==================
+# ================== Direct Messaging ==================
 def _resolve_pair(sender_id: int, other_user_id: int) -> Tuple[int, int]:
-    """
-    Resolve (client_id, lawyer_id) given the two participants; validates roles.
-    """
     db = get_db()
     s = db.execute("SELECT id, role FROM users WHERE id=?", (sender_id,)).fetchone()
     o = db.execute("SELECT id, role FROM users WHERE id=?", (other_user_id,)).fetchone()
@@ -407,10 +338,6 @@ def _resolve_pair(sender_id: int, other_user_id: int) -> Tuple[int, int]:
 @app.post("/messages/send")
 @jwt_required
 def send_message():
-    """
-    Body JSON: { "to_user_id": int, "message": str }
-    Stores message with (client_id, lawyer_id, sender_id).
-    """
     try:
         data = request.get_json(force=True)
         to_user_id = data.get("to_user_id")
@@ -438,12 +365,6 @@ def send_message():
 @app.get("/messages/thread")
 @jwt_required
 def get_thread():
-    """
-    Query params:
-      - with_user_id (required): other participant
-      - limit (optional, default 100)
-      - before_id / after_id (optional): pagination cursors on chat id
-    """
     try:
         other_id = request.args.get("with_user_id", type=int)
         if not other_id:
@@ -452,29 +373,12 @@ def get_thread():
         limit = request.args.get("limit", default=100, type=int)
         limit = max(1, min(limit, 500))
 
-        before_id = request.args.get("before_id", type=int)
-        after_id = request.args.get("after_id", type=int)
-
         client_id, lawyer_id = _resolve_pair(g.user["id"], other_id)
         db = get_db()
-
-        sql = ["SELECT * FROM chats WHERE client_id=? AND lawyer_id=?"]
-        params: List[Any] = [client_id, lawyer_id]
-
-        if before_id is not None:
-            sql.append("AND id < ?")
-            params.append(before_id)
-        if after_id is not None:
-            sql.append("AND id > ?")
-            params.append(after_id)
-
-        sql.append("ORDER BY id DESC")
-        sql.append("LIMIT ?")
-        params.append(limit)
-
-        rows = db.execute(" ".join(sql), tuple(params)).fetchall()
-        # reverse to chronological ascending for UI
-        rows = list(reversed(rows))
+        rows = db.execute(
+            "SELECT * FROM chats WHERE client_id=? AND lawyer_id=? ORDER BY id DESC LIMIT ?",
+            (client_id, lawyer_id, limit)
+        ).fetchall()
 
         msgs = [{
             "id": r["id"],
@@ -483,7 +387,7 @@ def get_thread():
             "sender_id": r["sender_id"],
             "message": r["message"],
             "created_at": r["created_at"],
-        } for r in rows]
+        } for r in reversed(rows)]
 
         return jsonify({"messages": msgs})
     except ValueError as ve:
@@ -492,13 +396,51 @@ def get_thread():
         app.logger.exception("get_thread failed")
         return jsonify({"error": f"get_thread failed: {e}"}), 500
 
-# ================== Chat with LLM (optional protection) ==================
-def _maybe_protect(fn):
-    # Apply @jwt_required dynamically based on PROTECT_CHAT_ROUTES
-    return jwt_required(fn) if PROTECT_CHAT_ROUTES else fn
+@app.get("/messages/partners")
+@jwt_required
+def list_partners():
+    try:
+        limit = request.args.get("limit", default=100, type=int)
+        limit = max(1, min(limit, 500))
 
+        db = get_db()
+        rows = db.execute(
+            "SELECT * FROM chats WHERE client_id=? OR lawyer_id=? ORDER BY id DESC",
+            (g.user["id"], g.user["id"])
+        ).fetchall()
+
+        seen = set()
+        partners: List[Dict[str, Any]] = []
+        for r in rows:
+            other_id = r["lawyer_id"] if g.user["id"] == r["client_id"] else r["client_id"]
+            if other_id in seen:
+                continue
+            seen.add(other_id)
+
+            u = db.execute("SELECT * FROM users WHERE id=?", (other_id,)).fetchone()
+            if not u:
+                continue
+
+            partners.append({
+                "id": u["id"],
+                "email": u["email"],
+                "role": u["role"],
+                "location_name": u["location_name"],
+                "last_message": r["message"],
+                "last_at": r["created_at"],
+                "last_sender_id": r["sender_id"],
+            })
+
+            if len(partners) >= limit:
+                break
+
+        return jsonify({"partners": partners})
+    except Exception as e:
+        app.logger.exception("list_partners failed")
+        return jsonify({"error": f"list_partners failed: {e}"}), 500
+
+# ================== Legal AI Chat ==================
 @app.route("/chat", methods=["POST"])
-@_maybe_protect
 def chat():
     try:
         top_k = 6
@@ -543,67 +485,40 @@ def chat():
         return jsonify({"error": str(e)}), 503
     except Exception as e:
         app.logger.exception("chat failed")
-        return jsonify({"error": f"chat failed: {e}"}), 500    
-    
-@app.get("/messages/partners")
-@jwt_required
-def list_partners():
-    """
-    Returns distinct conversation partners for the current user, most-recent first.
-    Optional: ?limit=200  (default 100)
-    Response:
-      { "partners": [
-          { "id": int, "email": str, "role": "client"|"lawyer",
-            "location_name": str|null, "location_lat": float|null, "location_lon": float|null,
-            "last_message": str, "last_at": iso8601, "last_sender_id": int }
-        ]
-      }
-    """
+        return jsonify({"error": f"chat failed: {e}"}), 500
+
+@app.route("/chat/stream", methods=["POST"])
+def chat_stream():
     try:
-        limit = request.args.get("limit", default=100, type=int)
-        limit = max(1, min(limit, 500))
+        data = request.get_json(force=True)
+        msg = (data.get("message") or "").strip()
+        session_id = data.get("session_id")
+        user_doc_text = data.get("user_doc_text")
+        top_k = int(data.get("top_k") or 6)
 
-        db = get_db()
-        # Get all chats where current user is involved, newest first
-        rows = db.execute(
-            "SELECT * FROM chats WHERE client_id=? OR lawyer_id=? ORDER BY id DESC",
-            (g.user["id"], g.user["id"])
-        ).fetchall()
+        if not msg:
+            return jsonify({"error": "message is required"}), 400
 
-        seen = set()
-        partners: List[Dict[str, Any]] = []
-        for r in rows:
-            # Determine the other participant
-            other_id = r["lawyer_id"] if g.user["id"] == r["client_id"] else r["client_id"]
-            if other_id in seen:
-                continue
-            seen.add(other_id)
+        def generate():
+            for chunk in agent.stream_answer(
+                user_message=msg,
+                session_id=session_id,
+                user_doc_text=user_doc_text,
+                top_k=top_k
+            ):
+                yield f"data: {chunk}\n\n"
 
-            u = db.execute("SELECT * FROM users WHERE id=?", (other_id,)).fetchone()
-            if not u:
-                continue
-
-            partners.append({
-                "id": u["id"],
-                "email": u["email"],
-                "role": u["role"],
-                "location_name": u["location_name"],
-                "location_lat": u["location_lat"],
-                "location_lon": u["location_lon"],
-                "last_message": r["message"],
-                "last_at": r["created_at"],
-                "last_sender_id": r["sender_id"],
-            })
-
-            if len(partners) >= limit:
-                break
-
-        return jsonify({"partners": partners})
+        return Response(stream_with_context(generate()), mimetype="text/event-stream")
     except Exception as e:
-        app.logger.exception("list_partners failed")
-        return jsonify({"error": f"list_partners failed: {e}"}), 500
+        app.logger.exception("chat stream failed")
+        return jsonify({"error": f"chat stream failed: {e}"}), 500
 
+@app.post("/chat/reset")
+def chat_reset():
+    agent.reset_memory()
+    return jsonify({"status": "conversation memory reset"})
 
-# ================== Main ==================
+# ================== Server Launcher ==================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    print(">>> Starting Flask API on http://127.0.0.1:5000 ...")
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
